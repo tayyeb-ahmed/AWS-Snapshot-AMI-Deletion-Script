@@ -1,0 +1,109 @@
+import boto3
+from datetime import datetime, timedelta
+from botocore.exceptions import ClientError
+import time
+
+# Set the AWS region and the dry run flag
+region = 'us-east-1'
+dry_run_enabled = False
+
+# Create the boto3 client for EC2
+ec2_client = boto3.client('ec2', region_name=region)
+
+# Get the current time and calculate the cutoff date
+now = datetime.utcnow().replace(tzinfo=None)
+cutoff_date = now - timedelta(days=60)
+
+# Get all the snapshots that are older than the cutoff date
+response = ec2_client.describe_snapshots(OwnerIds=['self'])
+snapshots_to_delete = []
+for snapshot in response['Snapshots']:
+    if 'StartTime' in snapshot:
+        # Convert the snapshot start time to an offset-naive datetime object
+        start_time = snapshot['StartTime'].astimezone().replace(tzinfo=None)
+        if start_time < cutoff_date:
+            snapshots_to_delete.append(snapshot)
+
+# Check if each snapshot is in use or associated with an AMI, and delete it if not
+for snapshot in snapshots_to_delete:
+    snapshot_id = snapshot['SnapshotId']
+    try:
+        # Check if the snapshot is associated with an AMI
+        response = ec2_client.describe_images(Filters=[{'Name': 'block-device-mapping.snapshot-id', 'Values': [snapshot_id]}])
+        if response['Images']:
+            # Get the creation date of the associated AMI
+            ami_creation_date = response['Images'][0]['CreationDate']
+            ami_creation_time = datetime.strptime(ami_creation_date, '%Y-%m-%dT%H:%M:%S.%fZ')
+            # Deregister the associated AMI if it's older than the cutoff date
+            if ami_creation_time < cutoff_date:
+                ami_id = response['Images'][0]['ImageId']
+                if not dry_run_enabled:
+                    ec2_client.deregister_image(ImageId=ami_id, DryRun=dry_run_enabled)
+                    print(f"Deregistered AMI {ami_id}")
+                else:
+                    print(f"Would have deregistered AMI {ami_id}")
+        else:
+            # Delete the snapshot if it's not associated with an AMI
+            if not dry_run_enabled:
+                ec2_client.delete_snapshot(SnapshotId=snapshot_id, DryRun=dry_run_enabled)
+                print(f"Deleted snapshot {snapshot_id}")
+            else:
+                print(f"Would have deleted snapshot {snapshot_id}")
+    except ClientError as e:
+        # Handle the case where the snapshot is in use
+        if e.response['Error']['Code'] == 'InvalidSnapshot.InUse':
+            print(f"Snapshot {snapshot_id} is in use, skipping deletion")
+        else:
+            print(f"Error deleting snapshot {snapshot_id}: {e}")
+
+# Wait for any snapshot deletions or AMI deregistrations to complete
+print("Waiting for snapshot deletions and AMI deregistrations to complete...")
+waiter = ec2_client.get_waiter('snapshot_completed')
+for snapshot in snapshots_to_delete:
+    snapshot_id = snapshot['SnapshotId']
+    try:
+        waiter.wait(SnapshotIds=[snapshot_id])
+        print(f"Snapshot {snapshot_id} deletion completed")
+    except ClientError as e:
+        print(f"Error waiting for snapshot {snapshot_id} deletion: {e}")
+
+    if not dry_run_enabled:
+        time.sleep(10) # Wait for 10 seconds before checking AMI deregistration
+
+    try:
+        response = ec2_client.describe_images(Filters=[{'Name': 'block-device-mapping.snapshot-id', 'Values': [snapshot_id]}])
+        if response['Images']:
+        #Check if there are any remaining AMIs associated with the snapshot, and deregister them if they're older than the cutoff date
+            for image in response['Images']:
+                ami_creation_date = image['CreationDate']
+                ami_creation_time = datetime.strptime(ami_creation_date, '%Y-%m-%dT%H:%M:%S.%fZ')
+                if ami_creation_time < cutoff_date:
+                    ami_id = image['ImageId']
+                    try:
+                        if not dry_run_enabled:
+                            ec2_client.deregister_image(ImageId=ami_id, DryRun=dry_run_enabled)
+                            print(f"Deregistered AMI {ami_id}")
+                        else:
+                            print(f"Would have deregistered AMI {ami_id}")
+                    except ClientError as e:
+                        print(f"Error deregistering AMI {ami_id}: {e}")
+    except ClientError as e:
+        print(f"Error describing images associated with snapshot {snapshot_id}: {e}")
+    #continue
+
+#Wait for any AMI deregistrations to complete
+print("Waiting for AMI deregistrations to complete...")
+#waiter = ec2_client.get_waiter('image_deregistered')
+for snapshot in snapshots_to_delete:
+    snapshot_id = snapshot['SnapshotId']
+    try:
+        response = ec2_client.describe_images(Filters=[{'Name': 'block-device-mapping.snapshot-id', 'Values': [snapshot_id]}])
+        if response['Images']:
+            for image in response['Images']:
+                ami_id = image['ImageId']
+                #waiter.wait(ImageIds=[ami_id])
+                print(f"AMI {ami_id} deregistration completed")
+    except ClientError as e:
+        print(f"Error waiting for AMI deregistration associated with snapshot {snapshot_id}: {e}")
+
+print("Script execution completed.")
